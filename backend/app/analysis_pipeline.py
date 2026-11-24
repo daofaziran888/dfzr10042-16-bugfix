@@ -1,6 +1,6 @@
 """洞察工坊 · 跨模块分析管道
 
-实现 10 条关键跨模块数据流：
+实现 11 条关键跨模块数据流：
 1. metric_def -> olap_query -> query_cache -> dashboard_def
 2. dimension_def -> drill_path -> olap_query
 3. event_track -> segment_builder -> user_segment
@@ -11,6 +11,7 @@
 8. olap_query -> data_export -> data_snapshot
 9. dataset_join -> olap_query -> report_builder
 10. ranking_board -> metric_def
+11. dashboard_def -> query_cache -> dashboard_subscription（看板订阅发件）
 
 所有管道函数都是确定性纯函数，可直接用于测试。
 """
@@ -18,6 +19,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.dashboard_subscription import (
+    ConfirmedQueryScope,
+    DashboardQueryCache,
+    DepartmentWalletLedger,
+    SendRecordStore,
+    SubscriptionService,
+    WalletFact,
+)
 from app.models import (
     ABExperiment,
     AggregationMethod,
@@ -651,6 +660,57 @@ def pipeline_ranking_to_metric(
 
 
 # ============================================================
+# 流 11: dashboard_def -> query_cache -> dashboard_subscription
+# 看板定义 -> 查询缓存 -> 看板订阅发件
+# ============================================================
+
+def pipeline_dashboard_subscription(
+    wallet_facts: list[dict[str, Any]],
+    subscriptions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """综合分析中的看板订阅发件管道。
+
+    1. 部门钱包事实按发布状态过滤（与看板查询同一口径，草稿不计入）
+    2. 订阅按确认的查询范围取数，缓存按完整查询条件键控
+    3. 发件记录携带当次查询条件和入算数据，按订阅运行号幂等落库
+    """
+    ledger = DepartmentWalletLedger([WalletFact(**fact) for fact in wallet_facts])
+    cache = DashboardQueryCache()
+    send_store = SendRecordStore()
+    service = SubscriptionService(ledger, cache, send_store)
+
+    sent = []
+    for tick, sub in enumerate(subscriptions):
+        scope = ConfirmedQueryScope(
+            query_name=sub["query_name"],
+            department=sub["department"],
+            time_range=sub.get("time_range", ""),
+        )
+        record = service.run_subscription(
+            subscription_id=sub["subscription_id"],
+            run_id=sub.get("run_id", f"{sub['subscription_id']}#0"),
+            scope=scope,
+            now=tick,
+        )
+        sent.append({
+            "subscription_id": record.subscription_id,
+            "run_id": record.run_id,
+            "department": record.department,
+            "query_name": record.scope.query_name,
+            "publish_status": record.scope.publish_status,
+            "amount": record.amount,
+            "fact_ids": [f.fact_id for f in record.facts],
+            "data_version": record.data_version,
+        })
+
+    return {
+        "pipeline": "dashboard_def -> query_cache -> dashboard_subscription",
+        "sent": sent,
+        "total_sent": len(sent),
+    }
+
+
+# ============================================================
 # 全量跨模块集成管道
 # ============================================================
 
@@ -734,6 +794,12 @@ def run_full_analysis_pipeline(
     if ranking_boards:
         all_results["flow10_ranking"] = pipeline_ranking_to_metric(
             ranking_boards, sample_data.get("ranking_data", {})
+        )
+
+    # 流 11
+    if sample_data.get("wallet_facts") and sample_data.get("dashboard_subscriptions"):
+        all_results["flow11_subscription"] = pipeline_dashboard_subscription(
+            sample_data["wallet_facts"], sample_data["dashboard_subscriptions"]
         )
 
     return all_results
